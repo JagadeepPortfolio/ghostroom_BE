@@ -7,14 +7,20 @@ export interface Message {
   readBy: Record<string, number>;
 }
 
+export interface UserInfo {
+  username: string;
+  sessionId: string;
+}
+
 export interface Room {
   id: string;
-  users: Map<string, string>; // socketId -> username
+  users: Map<string, UserInfo>; // socketId -> { username, sessionId }
   messages: Map<string, Message>; // messageId -> Message
 }
 
 class RoomStore {
   private rooms: Map<string, Room> = new Map();
+  private disconnectTimers: Map<string, NodeJS.Timeout> = new Map(); // sessionId -> timer
 
   createRoom(roomId: string): Room {
     const room: Room = {
@@ -34,16 +40,23 @@ class RoomStore {
     return this.rooms.has(roomId);
   }
 
-  addUser(roomId: string, socketId: string, username: string): boolean {
+  addUser(
+    roomId: string,
+    socketId: string,
+    username: string,
+    sessionId: string
+  ): boolean {
     const room = this.rooms.get(roomId);
     if (!room) return false;
 
-    // Check username uniqueness in this room
-    for (const [, existingName] of room.users) {
-      if (existingName === username) return false;
+    // Check username uniqueness — allow if same sessionId
+    for (const [, info] of room.users) {
+      if (info.username === username && info.sessionId !== sessionId) {
+        return false;
+      }
     }
 
-    room.users.set(socketId, username);
+    room.users.set(socketId, { username, sessionId });
     return true;
   }
 
@@ -51,8 +64,8 @@ class RoomStore {
     const room = this.rooms.get(roomId);
     if (!room) return undefined;
 
-    const username = room.users.get(socketId);
-    if (!username) return undefined;
+    const info = room.users.get(socketId);
+    if (!info) return undefined;
 
     room.users.delete(socketId);
 
@@ -64,28 +77,84 @@ class RoomStore {
       this.rooms.delete(roomId);
     }
 
-    return username;
+    return info.username;
   }
 
   getUsernames(roomId: string): string[] {
     const room = this.rooms.get(roomId);
     if (!room) return [];
-    return Array.from(room.users.values());
+    return Array.from(room.users.values()).map((u) => u.username);
   }
 
   getUsernameBySocketId(roomId: string, socketId: string): string | undefined {
     const room = this.rooms.get(roomId);
     if (!room) return undefined;
-    return room.users.get(socketId);
+    return room.users.get(socketId)?.username;
   }
 
-  isUsernameTaken(roomId: string, username: string): boolean {
+  isUsernameTaken(
+    roomId: string,
+    username: string,
+    sessionId?: string
+  ): boolean {
     const room = this.rooms.get(roomId);
     if (!room) return false;
-    for (const [, existingName] of room.users) {
-      if (existingName === username) return true;
+    for (const [, info] of room.users) {
+      if (info.username === username && info.sessionId !== sessionId) {
+        return true;
+      }
     }
     return false;
+  }
+
+  findBySessionId(
+    roomId: string,
+    sessionId: string
+  ): { socketId: string; username: string } | undefined {
+    const room = this.rooms.get(roomId);
+    if (!room) return undefined;
+    for (const [socketId, info] of room.users) {
+      if (info.sessionId === sessionId) {
+        return { socketId, username: info.username };
+      }
+    }
+    return undefined;
+  }
+
+  replaceSocket(
+    roomId: string,
+    oldSocketId: string,
+    newSocketId: string,
+    username: string,
+    sessionId: string
+  ): boolean {
+    const room = this.rooms.get(roomId);
+    if (!room) return false;
+
+    room.users.delete(oldSocketId);
+    room.users.set(newSocketId, { username, sessionId });
+    return true;
+  }
+
+  // Grace period management
+  setDisconnectTimer(sessionId: string, timer: NodeJS.Timeout): void {
+    this.disconnectTimers.set(sessionId, timer);
+  }
+
+  cancelDisconnectTimer(sessionId: string): boolean {
+    const timer = this.disconnectTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.disconnectTimers.delete(sessionId);
+      return true;
+    }
+    return false;
+  }
+
+  getSessionIdBySocketId(roomId: string, socketId: string): string | undefined {
+    const room = this.rooms.get(roomId);
+    if (!room) return undefined;
+    return room.users.get(socketId)?.sessionId;
   }
 
   addMessage(roomId: string, message: Message): boolean {
@@ -113,10 +182,12 @@ class RoomStore {
     return message;
   }
 
-  /**
-   * Check if a message has been read by all current room users.
-   * If so, delete it from the store and return true.
-   */
+  getUnburnedMessages(roomId: string): Message[] {
+    const room = this.rooms.get(roomId);
+    if (!room) return [];
+    return Array.from(room.messages.values());
+  }
+
   tryBurnMessage(roomId: string, messageId: string): boolean {
     const room = this.rooms.get(roomId);
     if (!room) return false;
@@ -124,7 +195,9 @@ class RoomStore {
     const message = room.messages.get(messageId);
     if (!message) return false;
 
-    const currentUsers = Array.from(room.users.values());
+    const currentUsers = Array.from(room.users.values()).map(
+      (u) => u.username
+    );
     const allRead = currentUsers.every((user) => message.readBy[user]);
 
     if (allRead) {
@@ -135,17 +208,14 @@ class RoomStore {
     return false;
   }
 
-  /**
-   * After a user disconnects, re-check all messages in the room.
-   * Some messages may now qualify for burning since the disconnected
-   * user is no longer in the required readers list.
-   */
   private cleanupMessagesForRoom(roomId: string): string[] {
     const room = this.rooms.get(roomId);
     if (!room) return [];
 
     const burnedIds: string[] = [];
-    const currentUsers = Array.from(room.users.values());
+    const currentUsers = Array.from(room.users.values()).map(
+      (u) => u.username
+    );
 
     if (currentUsers.length === 0) return burnedIds;
 

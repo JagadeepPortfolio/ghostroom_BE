@@ -3,6 +3,8 @@ import { v4 as uuidv4 } from "uuid";
 import { roomStore, Message } from "./room-store";
 import { isRateLimited, clearRateLimit } from "./rate-limiter";
 
+const GRACE_PERIOD_MS = 30_000; // 30 seconds
+
 // Basic XSS sanitization
 function sanitize(text: string): string {
   return text
@@ -39,10 +41,14 @@ export function registerSocketHandlers(io: Server): void {
     socket.on(
       "check_username",
       (
-        { roomId, username }: { roomId: string; username: string },
+        {
+          roomId,
+          username,
+          sessionId,
+        }: { roomId: string; username: string; sessionId?: string },
         callback: (data: { available: boolean }) => void
       ) => {
-        const taken = roomStore.isUsernameTaken(roomId, username);
+        const taken = roomStore.isUsernameTaken(roomId, username, sessionId);
         callback({ available: !taken });
       }
     );
@@ -51,7 +57,11 @@ export function registerSocketHandlers(io: Server): void {
     socket.on(
       "join_room",
       (
-        { roomId, username }: { roomId: string; username: string },
+        {
+          roomId,
+          username,
+          sessionId,
+        }: { roomId: string; username: string; sessionId: string },
         callback: (data: { success: boolean; error?: string }) => void
       ) => {
         // Auto-create room if it doesn't exist
@@ -65,14 +75,54 @@ export function registerSocketHandlers(io: Server): void {
           return;
         }
 
-        const added = roomStore.addUser(roomId, socket.id, sanitizedName);
+        // Cancel any pending grace period for this session
+        roomStore.cancelDisconnectTimer(sessionId);
+
+        // Check if this session already has an active socket in the room
+        const existing = roomStore.findBySessionId(roomId, sessionId);
+        if (existing) {
+          // Replace old socket with new one (reconnect)
+          roomStore.replaceSocket(
+            roomId,
+            existing.socketId,
+            socket.id,
+            sanitizedName,
+            sessionId
+          );
+          socket.join(roomId);
+          callback({ success: true });
+
+          // Send existing messages to the rejoining user
+          const messages = roomStore.getUnburnedMessages(roomId);
+          socket.emit("existing_messages", messages);
+
+          // Broadcast updated user list (no user_joined since they were already in)
+          const users = roomStore.getUsernames(roomId);
+          io.to(roomId).emit("room_users", users);
+          return;
+        }
+
+        // New user joining
+        const added = roomStore.addUser(
+          roomId,
+          socket.id,
+          sanitizedName,
+          sessionId
+        );
         if (!added) {
-          callback({ success: false, error: "Username already taken in this room" });
+          callback({
+            success: false,
+            error: "Username already taken in this room",
+          });
           return;
         }
 
         socket.join(roomId);
         callback({ success: true });
+
+        // Send existing messages to the new user
+        const messages = roomStore.getUnburnedMessages(roomId);
+        socket.emit("existing_messages", messages);
 
         // Broadcast updated user list
         const users = roomStore.getUsernames(roomId);
@@ -102,7 +152,7 @@ export function registerSocketHandlers(io: Server): void {
           text: sanitizedText,
           roomId,
           createdAt: Date.now(),
-          readBy: { [sender]: Date.now() }, // Sender auto-reads
+          readBy: { [sender]: Date.now() }, // Sender auto-reads (for server burn calc)
         };
 
         roomStore.addMessage(roomId, message);
@@ -155,7 +205,7 @@ export function registerSocketHandlers(io: Server): void {
       }
     );
 
-    // Disconnect
+    // Disconnect — start grace period instead of immediate removal
     socket.on("disconnect", () => {
       console.log(`[disconnect] ${socket.id}`);
       clearRateLimit(socket.id);
@@ -163,13 +213,28 @@ export function registerSocketHandlers(io: Server): void {
       const roomId = roomStore.findRoomBySocketId(socket.id);
       if (!roomId) return;
 
-      const username = roomStore.removeUser(roomId, socket.id);
+      const sessionId = roomStore.getSessionIdBySocketId(roomId, socket.id);
+      if (!sessionId) return;
+
+      const username = roomStore.getUsernameBySocketId(roomId, socket.id);
       if (!username) return;
 
-      // Broadcast updated user list and departure
-      const users = roomStore.getUsernames(roomId);
-      io.to(roomId).emit("room_users", users);
-      io.to(roomId).emit("user_left", { username });
+      console.log(
+        `[grace-start] ${username} (${sessionId}) — 30s grace period`
+      );
+
+      // Start grace period
+      const timer = setTimeout(() => {
+        console.log(`[grace-expired] ${username} (${sessionId}) — removing`);
+        roomStore.removeUser(roomId, socket.id);
+
+        // Broadcast updated user list and departure
+        const users = roomStore.getUsernames(roomId);
+        io.to(roomId).emit("room_users", users);
+        io.to(roomId).emit("user_left", { username });
+      }, GRACE_PERIOD_MS);
+
+      roomStore.setDisconnectTimer(sessionId, timer);
     });
   });
 }
