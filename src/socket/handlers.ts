@@ -47,16 +47,16 @@ export function registerSocketHandlers(io: Server): void {
       }
     );
 
-    // Join room
+    // Join room (auto-creates if it doesn't exist)
     socket.on(
       "join_room",
       (
         { roomId, username }: { roomId: string; username: string },
         callback: (data: { success: boolean; error?: string }) => void
       ) => {
+        // Auto-create room if it doesn't exist
         if (!roomStore.roomExists(roomId)) {
-          callback({ success: false, error: "Room not found" });
-          return;
+          roomStore.createRoom(roomId);
         }
 
         const sanitizedName = sanitize(username.trim());
