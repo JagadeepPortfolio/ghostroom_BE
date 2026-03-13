@@ -12,4 +12,4 @@ primary_region = 'sin'
 
 [env]
   PORT = '3001'
-  CORS_ORIGIN = 'https://ghostroomfevercel.vercel.app'
+  CORS_ORIGIN = 'https://ghostroomfeprod.vercel.app'
